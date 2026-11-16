@@ -41,7 +41,7 @@ Everything is one CloudFormation stack: [`template.yaml`](template.yaml).
 
 Free plan allowances: 1M requests and 100 GB transfer per month. These are guardrails, not a bill: there are no overage charges, and I get emailed if anything tagged for this project costs money anyway.
 
-Limits that shaped the template: at most 5 WAF rules and no custom rule groups, only AWS-managed cache and response-header policies, no Lambda@Edge or real-time logs, and edge functions can't be shared with other distributions.
+Limits that shaped the template: the distribution must use all edge locations (`PriceClass_All`; anything narrower is rejected as "not eligible for this subscription tier"), at most 5 WAF rules and no custom rule groups, only AWS-managed cache and response-header policies, no Lambda@Edge or real-time logs, and edge functions can't be shared with other distributions.
 
 ## Deploy
 

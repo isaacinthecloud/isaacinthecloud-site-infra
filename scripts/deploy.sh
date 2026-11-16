@@ -21,6 +21,7 @@ params=(
   "DomainName=$DOMAIN_NAME"
   "HostedZoneId=$HOSTED_ZONE_ID"
   "BudgetAlertEmail=$BUDGET_ALERT_EMAIL"
+  "EnablePricingPlan=${ENABLE_PRICING_PLAN:-true}"
   "AttachHostedZoneToPlan=${ATTACH_HOSTED_ZONE:-false}"
   "MonthlyBudgetUsd=${MONTHLY_BUDGET_USD:-1}"
 )

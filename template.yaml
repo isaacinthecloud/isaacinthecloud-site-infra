@@ -11,7 +11,7 @@ Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label: { default: Site }
-        Parameters: [DomainName, HostedZoneId, AttachHostedZoneToPlan]
+        Parameters: [DomainName, HostedZoneId, EnablePricingPlan, AttachHostedZoneToPlan]
       - Label: { default: Cost controls }
         Parameters: [MonthlyBudgetUsd, BudgetAlertEmail]
       - Label: { default: Protection }
@@ -26,6 +26,13 @@ Parameters:
   HostedZoneId:
     Type: AWS::Route53::HostedZone::Id
     Description: Public Route 53 hosted zone for DomainName.
+  EnablePricingPlan:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: >-
+      Subscribe the distribution to the CloudFront flat-rate Free plan. Set false to
+      run on pay-as-you-go pricing (e.g. while troubleshooting plan eligibility).
   AttachHostedZoneToPlan:
     Type: String
     AllowedValues: ["true", "false"]
@@ -51,7 +58,8 @@ Parameters:
     Description: Requests one IP may send in 5 minutes before WAF blocks it.
 
 Conditions:
-  AttachZone: !Equals [!Ref AttachHostedZoneToPlan, "true"]
+  PlanEnabled: !Equals [!Ref EnablePricingPlan, "true"]
+  AttachZone: !And [!Condition PlanEnabled, !Equals [!Ref AttachHostedZoneToPlan, "true"]]
 
 Resources:
   # ---------- Storage ----------
@@ -314,7 +322,7 @@ Resources:
           MinimumProtocolVersion: TLSv1.2_2021
         HttpVersion: http2and3
         IPV6Enabled: true
-        PriceClass: PriceClass_100
+        PriceClass: PriceClass_All # flat-rate plans cover every edge location
         DefaultRootObject: index.html
         WebACLId: !GetAtt WebAcl.Arn
         Origins:
@@ -343,6 +351,7 @@ Resources:
 
   PricingPlan:
     Type: AWS::PricingPlanManager::Subscription
+    Condition: PlanEnabled
     Metadata:
       com.aws.cloudformation.Context:
         why: >-
@@ -485,6 +494,7 @@ Outputs:
   DistributionDomain:
     Value: !GetAtt Distribution.DomainName
   PricingPlanStatus:
+    Condition: PlanEnabled
     Value: !GetAtt PricingPlan.Status
   DeployPolicyArn:
     Value: !Ref DeployPolicy

@@ -1,0 +1,4 @@
+deploy.env
+dist/
+__pycache__/
+.venv/

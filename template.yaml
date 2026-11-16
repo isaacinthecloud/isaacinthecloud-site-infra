@@ -1,0 +1,490 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Static hosting for isaacinthecloud.com: a private S3 bucket behind CloudFront (OAC),
+  an ACM certificate, AWS WAF, Route 53 aliases for the apex and www, the CloudFront
+  flat-rate Free plan (no overage charges), a cost budget, and a least-privilege
+  deploy policy. Deploy in us-east-1 (CloudFront certificates and WAF web ACLs live there).
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Site }
+        Parameters: [DomainName, HostedZoneId, AttachHostedZoneToPlan]
+      - Label: { default: Cost controls }
+        Parameters: [MonthlyBudgetUsd, BudgetAlertEmail]
+      - Label: { default: Protection }
+        Parameters: [RateLimitPer5Min]
+
+Parameters:
+  DomainName:
+    Type: String
+    Description: Apex domain served by the site. www.<domain> redirects to it.
+    AllowedPattern: "^(?!www\\.)[a-z0-9-]+(\\.[a-z0-9-]+)+$"
+    ConstraintDescription: A lowercase apex domain such as example.com (no www).
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Description: Public Route 53 hosted zone for DomainName.
+  AttachHostedZoneToPlan:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: >-
+      Put the hosted zone on the CloudFront Free plan, which then covers its monthly fee
+      and DNS queries. The Free plan allows at most 50 records in the zone.
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Monthly cost budget for resources tagged Project=<stack name>.
+  BudgetAlertEmail:
+    Type: String
+    NoEcho: true
+    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    ConstraintDescription: A single email address.
+    Description: Address for budget alerts. Kept out of the repo (see deploy.env.example).
+  RateLimitPer5Min:
+    Type: Number
+    Default: 500
+    MinValue: 100
+    Description: Requests one IP may send in 5 minutes before WAF blocks it.
+
+Conditions:
+  AttachZone: !Equals [!Ref AttachHostedZoneToPlan, "true"]
+
+Resources:
+  # ---------- Storage ----------
+
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Holds the static export of the WordPress site. Private; only CloudFront reads it
+          through OAC. Versioning allows rolling back a bad deploy; old versions expire
+          after 30 days so storage stays inside the plan's S3 credit.
+        must:
+          - Never enable public access or static website hosting; CloudFront OAC is the only reader.
+          - Retained on stack delete so the site content is never lost by accident.
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: Access logging adds storage cost; CloudFront is the only reader.
+      guard:
+        SuppressedRules:
+          - S3_BUCKET_LOGGING_ENABLED
+          - S3_BUCKET_REPLICATION_ENABLED
+    Properties:
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: clean-delete-markers
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+      Tags:
+        - { Key: Project, Value: !Ref AWS::StackName }
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Lets only this distribution read objects, and rejects any non-TLS request.
+        must:
+          - Keep the AWS:SourceArn condition pinned to this distribution (confused-deputy protection).
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${SiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt SiteBucket.Arn
+              - !Sub "${SiteBucket.Arn}/*"
+            Condition:
+              Bool: { aws:SecureTransport: "false" }
+
+  # ---------- TLS ----------
+
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Public certificate for the apex and www, validated automatically through Route 53.
+        must:
+          - Must be in us-east-1 for CloudFront.
+    Properties:
+      DomainName: !Ref DomainName
+      SubjectAlternativeNames: [!Sub "www.${DomainName}"]
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+        - DomainName: !Sub "www.${DomainName}"
+          HostedZoneId: !Ref HostedZoneId
+      KeyAlgorithm: EC_prime256v1
+      Tags:
+        - { Key: Project, Value: !Ref AWS::StackName }
+
+  # ---------- Edge ----------
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-oac"
+        Description: Signed CloudFront requests to the private site bucket.
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  RouterFunction:
+    Type: AWS::CloudFront::Function
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Viewer-request routing at the edge: 301 www to the apex, and map directory-style
+          paths to their index.html (S3 behind OAC has no index documents of its own).
+        must:
+          - Used by this distribution only; the Free plan forbids sharing functions across distributions.
+    Properties:
+      Name: !Sub "${AWS::StackName}-router"
+      AutoPublish: true
+      FunctionConfig:
+        Comment: www to apex redirect and index.html rewrite
+        Runtime: cloudfront-js-2.0
+      FunctionCode: !Sub |
+        function handler(event) {
+          var req = event.request;
+          var host = req.headers.host ? req.headers.host.value : '';
+          if (host.indexOf('www.') === 0) {
+            var qs = [];
+            for (var k in req.querystring) {
+              var q = req.querystring[k];
+              if (q.multiValue) { q.multiValue.forEach(function (m) { qs.push(k + '=' + m.value); }); }
+              else { qs.push(k + (q.value ? '=' + q.value : '')); }
+            }
+            return {
+              statusCode: 301,
+              statusDescription: 'Moved Permanently',
+              headers: {
+                location: { value: 'https://${DomainName}' + req.uri + (qs.length ? '?' + qs.join('&') : '') },
+                'cache-control': { value: 'max-age=86400' }
+              }
+            };
+          }
+          if (req.uri.endsWith('/')) {
+            req.uri += 'index.html';
+          } else if (req.uri.split('/').pop().indexOf('.') === -1) {
+            req.uri += '/index.html';
+          }
+          return req;
+        }
+
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Required by the flat-rate plan. Four rules: IP reputation, common exploits,
+          known bad inputs, and a per-IP rate limit. Blocked requests do not count
+          against the plan's usage allowance.
+        must:
+          - At most 5 rules on the Free plan, and no rule groups of our own (managed groups referenced directly only).
+          - Scope CLOUDFRONT, so the stack must be in us-east-1.
+    Properties:
+      Name: !Sub "${AWS::StackName}-waf"
+      Scope: CLOUDFRONT
+      DefaultAction: { Allow: {} }
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${AWS::StackName}-waf"
+      Rules:
+        - Name: aws-ip-reputation
+          Priority: 0
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAmazonIpReputationList
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: ip-reputation
+        - Name: rate-limit-per-ip
+          Priority: 1
+          Action: { Block: {} }
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref RateLimitPer5Min
+              EvaluationWindowSec: 300
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: rate-limit
+        - Name: aws-common
+          Priority: 2
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: common
+        - Name: aws-known-bad-inputs
+          Priority: 3
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: known-bad-inputs
+      Tags:
+        - { Key: Project, Value: !Ref AWS::StackName }
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Serves the site over HTTPS on the apex and www with HTTP/2 and HTTP/3, IPv6,
+          AWS managed cache and security-header policies, and a static 404 page.
+        must:
+          - Only AWS managed cache/response-header policies; the Free plan does not allow custom ones.
+          - No real-time logs, Lambda@Edge, OAI, or legacy ForwardedValues (unsupported or billed outside the plan).
+          - A WAF web ACL must stay attached while the plan is active.
+      checkov:
+        skip:
+          - id: CKV_AWS_86
+            comment: Access logs are not included in the Free plan.
+      guard:
+        SuppressedRules:
+          - CLOUDFRONT_ACCESSLOGS_ENABLED
+          - CLOUDFRONT_ORIGIN_FAILOVER_ENABLED
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${DomainName} static site"
+        Aliases:
+          - !Ref DomainName
+          - !Sub "www.${DomainName}"
+        ViewerCertificate:
+          AcmCertificateArn: !Ref Certificate
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        DefaultRootObject: index.html
+        WebACLId: !GetAtt WebAcl.Arn
+        Origins:
+          - Id: site-bucket
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: site-bucket
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # Managed-CachingOptimized
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03 # Managed-SecurityHeadersPolicy
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt RouterFunction.FunctionMetadata.FunctionARN
+        CustomErrorResponses:
+          # OAC without s3:ListBucket returns 403 for a missing key; show the 404 page for both.
+          - { ErrorCode: 403, ResponseCode: 404, ResponsePagePath: /404.html, ErrorCachingMinTTL: 60 }
+          - { ErrorCode: 404, ResponseCode: 404, ResponsePagePath: /404.html, ErrorCachingMinTTL: 60 }
+      Tags:
+        - { Key: Project, Value: !Ref AWS::StackName }
+
+  PricingPlan:
+    Type: AWS::PricingPlanManager::Subscription
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          CloudFront flat-rate Free plan: $0/month with no overage charges (traffic past
+          the allowance may be throttled instead of billed). Covers CloudFront, WAF, the
+          certificate, edge functions, and a 5 GB S3 credit.
+        must:
+          - PlanTier stays FREE; paid tiers bill a monthly fee once approved.
+          - Max 3 Free plans per account.
+          - The distribution cannot be deleted while subscribed; this resource is removed first on stack delete.
+    Properties:
+      PlanFamily: CloudFront
+      PlanTier: FREE
+      UsageLevel: DEFAULT
+      ResourceArns: !If
+        - AttachZone
+        - - !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+          - !GetAtt WebAcl.Arn
+          - !Sub "arn:${AWS::Partition}:route53:::hostedzone/${HostedZoneId}"
+        - - !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+          - !GetAtt WebAcl.Arn
+
+  # ---------- DNS ----------
+
+  DnsRecords:
+    Type: AWS::Route53::RecordSetGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Alias A/AAAA records for the apex and www. Alias queries to CloudFront are free.
+        must:
+          - Only adds A/AAAA; the zone's MX, TXT, CNAME and other records are managed elsewhere and must not be touched here.
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      RecordSets:
+        - Name: !Ref DomainName
+          Type: A
+          AliasTarget:
+            DNSName: !GetAtt Distribution.DomainName
+            HostedZoneId: Z2FDTNDATAQYW2 # CloudFront's fixed alias zone
+            EvaluateTargetHealth: false
+        - Name: !Ref DomainName
+          Type: AAAA
+          AliasTarget:
+            DNSName: !GetAtt Distribution.DomainName
+            HostedZoneId: Z2FDTNDATAQYW2 # CloudFront's fixed alias zone
+            EvaluateTargetHealth: false
+        - Name: !Sub "www.${DomainName}"
+          Type: A
+          AliasTarget:
+            DNSName: !GetAtt Distribution.DomainName
+            HostedZoneId: Z2FDTNDATAQYW2 # CloudFront's fixed alias zone
+            EvaluateTargetHealth: false
+        - Name: !Sub "www.${DomainName}"
+          Type: AAAA
+          AliasTarget:
+            DNSName: !GetAtt Distribution.DomainName
+            HostedZoneId: Z2FDTNDATAQYW2 # CloudFront's fixed alias zone
+            EvaluateTargetHealth: false
+
+  # ---------- Cost controls ----------
+
+  Budget:
+    Type: AWS::Budgets::Budget
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Email alert if anything tagged for this site starts costing money (expected $0,
+          plus Route 53's $0.50 zone fee when the zone is not on the plan, which is untagged).
+        must:
+          - The Project cost allocation tag must be activated in Billing for the filter to match.
+    Properties:
+      Budget:
+        BudgetName: !Sub "${AWS::StackName}-monthly"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetUsd
+          Unit: USD
+        CostFilters:
+          TagKeyValue:
+            - !Sub "user:Project$${AWS::StackName}"
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 50
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref BudgetAlertEmail }
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref BudgetAlertEmail }
+
+  # ---------- Deploy access ----------
+
+  DeployPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Exactly what scripts/deploy.sh needs: sync the bucket, invalidate the cache,
+          and read this stack's outputs. Attach to a CI role or a scoped user instead
+          of using admin credentials.
+        must:
+          - No wildcard resources beyond objects in this bucket.
+    Properties:
+      ManagedPolicyName: !Sub "${AWS::StackName}-deploy"
+      Description: Upload the static site and invalidate its CloudFront cache.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ListSite
+            Effect: Allow
+            Action: s3:ListBucket
+            Resource: !GetAtt SiteBucket.Arn
+          - Sid: WriteSite
+            Effect: Allow
+            Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+            Resource: !Sub "${SiteBucket.Arn}/*"
+          - Sid: Invalidate
+            Effect: Allow
+            Action: [cloudfront:CreateInvalidation, cloudfront:GetInvalidation]
+            Resource: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+          - Sid: ReadOutputs
+            Effect: Allow
+            Action: cloudformation:DescribeStacks
+            Resource: !Ref AWS::StackId
+
+Outputs:
+  SiteUrl:
+    Value: !Sub "https://${DomainName}/"
+  BucketName:
+    Value: !Ref SiteBucket
+  DistributionId:
+    Value: !Ref Distribution
+  DistributionDomain:
+    Value: !GetAtt Distribution.DomainName
+  PricingPlanStatus:
+    Value: !GetAtt PricingPlan.Status
+  DeployPolicyArn:
+    Value: !Ref DeployPolicy
